@@ -17,17 +17,23 @@ let seq = 0;
 const jobs = new Map();
 
 const FORMATS = {
-  alpha_prores: {
-    label: 'ProRes 4444（.mov，带透明通道）',
+  alpha_qtrle: {
+    label: '透明视频 · QuickTime 动画（.mov，推荐）',
     ext: 'mov',
     alpha: true,
-    note: '剪辑软件首选，透明通道最稳，颜色按 bt709 标准写入。',
+    note: '带透明通道、逐像素无损，速度最快、文件最小（大约只有 ProRes 的五分之一）。',
+  },
+  alpha_prores: {
+    label: '透明视频 · ProRes 4444（.mov，兼容性最保险）',
+    ext: 'mov',
+    alpha: true,
+    note: '如果上面那个在某些软件里导不进去，就用这个。文件大约大 5 倍、慢一倍。',
   },
   alpha_qtpng: {
-    label: 'QuickTime PNG（.mov，带透明通道，无损）',
+    label: '透明视频 · QuickTime PNG（.mov，逐像素无损）',
     ext: 'mov',
     alpha: true,
-    note: '逐像素完美无损，而且比 ProRes 更快，代价是文件略大。',
+    note: '逐像素完美无损，速度也快，代价是文件比「动画」大一些。',
   },
   png_seq: {
     label: 'PNG 序列（文件夹，带透明通道）',
@@ -65,11 +71,33 @@ function buildCommand(job) {
   const bt709 = ['-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709', '-color_range', 'tv'];
   const toBt709 = 'scale=out_color_matrix=bt709:out_range=tv';
 
+  // 客户端只送了「有内容的横条」，这里贴回整帧。
+  // pad 会把带子以外的区域补成完全透明。
+  const band = cfg.band;
+  const padFilter = (band && Number(band.h) < H)
+    ? `pad=${W}:${H}:0:${Math.max(0, Math.round(band.y))}:color=black@0`
+    : null;
+  const vfChain = (extra) => {
+    const parts = [];
+    if (padFilter) parts.push(padFilter);
+    if (extra) parts.push(extra);
+    return parts.length ? parts.join(',') : null;
+  };
+
   let args;
   switch (cfg.format) {
+    case 'alpha_qtrle':
+      // QuickTime 动画：纯 RGB 存储（argb），不做 YUV 转换，
+      // 因此既逐像素无损，又不存在色彩矩阵问题。
+      args = [...input,
+        ...(vfChain(null) ? ['-vf', vfChain(null)] : []),
+        '-c:v', 'qtrle', '-pix_fmt', 'argb',
+        '-y', out];
+      break;
+
     case 'alpha_prores':
       args = [...input,
-        '-vf', toBt709,
+        ...(vfChain(toBt709) ? ['-vf', vfChain(toBt709)] : []),
         '-c:v', 'prores_ks', '-profile:v', '4444', '-pix_fmt', 'yuva444p10le',
         '-qscale:v', '4', '-vendor', 'apl0', '-threads', String(THREADS),
         ...bt709,
@@ -78,6 +106,7 @@ function buildCommand(job) {
 
     case 'alpha_qtpng':
       args = [...input,
+        ...(vfChain(null) ? ['-vf', vfChain(null)] : []),
         '-c:v', 'png', '-pix_fmt', 'rgba', '-compression_level', '3',
         '-threads', String(THREADS),
         '-y', out];
@@ -85,6 +114,7 @@ function buildCommand(job) {
 
     case 'png_seq':
       args = [...input,
+        ...(vfChain(null) ? ['-vf', vfChain(null)] : []),
         '-c:v', 'png', '-pix_fmt', 'rgba', '-compression_level', '3',
         '-threads', String(THREADS),
         '-start_number', '1', '-y', path.join(out, 'frame_%05d.png')];
@@ -94,7 +124,7 @@ function buildCommand(job) {
       args = [
         '-f', 'lavfi', '-i', `color=c=${shade(cfg.previewBg || '#14141a')}:s=${W}x${H}:r=${fps}`,
         ...input,
-        '-filter_complex', `[0:v][1:v]overlay=format=auto,${toBt709},format=yuv420p`,
+        '-filter_complex', `[0:v][1:v]overlay=format=auto,${padFilter ? padFilter + ',' : ''}${toBt709},format=yuv420p`,
         '-c:v', 'libx264', '-crf', '16', '-preset', 'fast', '-threads', String(THREADS),
         ...bt709,
         '-movflags', '+faststart', '-t', String(job.frameCount / fps),
@@ -105,7 +135,7 @@ function buildCommand(job) {
       args = [
         '-f', 'lavfi', '-i', `color=c=${shade(cfg.keyColor || '#00FF00')}:s=${W}x${H}:r=${fps}`,
         ...input,
-        '-filter_complex', `[0:v][1:v]overlay=format=auto,${toBt709},format=yuv444p10le`,
+        '-filter_complex', `[0:v][1:v]overlay=format=auto,${padFilter ? padFilter + ',' : ''}${toBt709},format=yuv444p10le`,
         '-c:v', 'prores_ks', '-profile:v', '4444', '-qscale:v', '4', '-threads', String(THREADS),
         ...bt709,
         '-t', String(job.frameCount / fps),
@@ -152,6 +182,9 @@ function startJob(cfg) {
     frameCount,
     outputPath: outPath,
     frames: 0,
+    nextSeq: 0,          // 下一批应该写入的序号，保证多批并发时顺序不乱
+    freeSeq: 0,          // 没带序号的请求按到达顺序自动编号
+    pendingFrames: new Map(),
     phase: 'rendering',
     error: null,
     startedAt: Date.now(),
@@ -189,8 +222,10 @@ function startJob(cfg) {
         job.error = job.error ||
           (job.stderrTail.trim().split(/\r?\n/).slice(-3).join('\n') || `ffmpeg 退出码 ${code}`);
         job.phase = 'failed';
+        discardOutput(job);          // 半成品会显示成「已损坏」，直接清掉
       } else if (job.cancelled) {
         job.phase = 'cancelled';
+        discardOutput(job);
       } else {
         job.phase = 'done';
       }
@@ -224,6 +259,49 @@ function getJob(id) {
   return jobs.get(String(id)) || null;
 }
 
+/**
+ * 删掉没写完的成品。
+ * ffmpeg 的索引（moov）是最后才写的，中途被打断会留下一个「文件在、但打不开」
+ * 的残片，用户会以为是工具坏了。所以失败或取消时直接清掉。
+ */
+function discardOutput(job) {
+  if (!job || !job.outputPath || job.outputDiscarded) return;
+  try {
+    if (job.cfg.format === 'png_seq') {
+      fs.rmSync(job.outputPath, { recursive: true, force: true });
+    } else {
+      fs.rmSync(job.outputPath, { force: true });
+    }
+    job.outputDiscarded = true;
+  } catch (_) { /* 忽略 */ }
+}
+
+/** 导出完成后校验成品：时长和分辨率是否和预期一致 */
+function verifyOutput(job) {
+  const fflib = require('./ffmpeg');
+  if (job.cfg.format === 'png_seq') {
+    let n = 0;
+    try { n = fs.readdirSync(job.outputPath).filter((f) => f.endsWith('.png')).length; } catch (_) {}
+    return { ok: n >= job.frameCount, kind: 'sequence', frames: n, expectedFrames: job.frameCount };
+  }
+  const info = fflib.probeMedia(job.cfg.ffmpegPath, job.outputPath);
+  if (!info.ok) return { ok: false, error: info.error };
+  const expected = job.frameCount / job.canvas.fps;
+  const okDuration = Math.abs(info.duration - expected) < 0.5;
+  const okSize = info.width === job.canvas.width && info.height === job.canvas.height;
+  return {
+    ok: okDuration && okSize,
+    duration: info.duration,
+    expectedDuration: Math.round(expected * 100) / 100,
+    width: info.width,
+    height: info.height,
+    expectedWidth: job.canvas.width,
+    expectedHeight: job.canvas.height,
+    okDuration,
+    okSize,
+  };
+}
+
 function statusOf(job) {
   const elapsed = (job.finishedAt || Date.now()) - job.startedAt;
   const pct = job.frameCount ? Math.min(1, job.frames / job.frameCount) : 0;
@@ -238,6 +316,8 @@ function statusOf(job) {
       ? Math.max(0, Math.round(elapsed / pct * (1 - pct)))
       : null,
     outputPath: job.outputPath,
+    outputDiscarded: !!job.outputDiscarded,
+    verify: job.verify || null,
     error: job.error,
     detail: job.progressText,
   };
@@ -250,6 +330,9 @@ async function cancelJob(id) {
   job.phase = 'cancelled';
   try { job.stdin.end(); } catch (_) {}
   try { job.child.kill(); } catch (_) {}
+  // 等 ffmpeg 真正退出，再把没写完的成品删掉
+  try { await job.done; } catch (_) {}
+  discardOutput(job);
   return true;
 }
 
@@ -259,6 +342,12 @@ async function finishJob(id) {
   job.phase = 'encoding';
   try { job.stdin.end(); } catch (_) {}
   await job.done;
+  if (job.phase === 'failed' || job.error) {
+    discardOutput(job);
+    job.verify = { ok: false, error: job.error || '编码失败' };
+  } else {
+    job.verify = verifyOutput(job);
+  }
   return statusOf(job);
 }
 
@@ -271,6 +360,14 @@ function cleanupOldJobs(maxAgeMs) {
   }
 }
 
+/** 是否还有正在跑的导出任务（有的话后台不许自动退出） */
+function hasActiveJob() {
+  for (const [, job] of jobs) {
+    if (job.phase === 'rendering' || job.phase === 'encoding') return true;
+  }
+  return false;
+}
+
 module.exports = {
   FORMATS,
   startJob,
@@ -279,4 +376,5 @@ module.exports = {
   finishJob,
   cancelJob,
   cleanupOldJobs,
+  hasActiveJob,
 };

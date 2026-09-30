@@ -363,6 +363,67 @@ function forceOuter(position) {
 }
 
 /**
+ * 算出「实际有内容的横条」范围。
+ * 整条进度条只占画面底部（或顶部）一小块，导出时只渲染这一条，
+ * 再让 ffmpeg 贴回整帧，可以省掉 3/4 的像素处理和编码开销。
+ *
+ * 宁可算宽一点：算宽了只是慢一点，算窄了会把内容裁掉。
+ */
+function computeBand(cfg) {
+  const geo = computeGeometry(cfg);
+  const H = geo.H;
+  const t = geo.track;
+  const thickness = Math.max(2, Number(cfg.bar.thickness) || 8);
+
+  let top = t.y;
+  let bottom = t.y + t.h;
+
+  const pad = Math.max(28, thickness * 3);
+
+  // 进度圆点（含发光）
+  if (cfg.dot.show) {
+    const r = Math.max(2, thickness * (Number(cfg.dot.size) || 2.2) / 2);
+    const glow = cfg.dot.glow ? r * 1.4 : 0;
+    top = Math.min(top, t.y + t.h / 2 - r - glow);
+    bottom = Math.max(bottom, t.y + t.h / 2 + r + glow);
+  }
+
+  const textBox = (position, fontSize, offset, letterPad) => {
+    const pos = textAnchor(position, t, fontSize, offset);
+    const boxTop = pos.baseline === 'top' ? pos.y : pos.y - fontSize * 1.35;
+    const boxBottom = pos.baseline === 'top' ? pos.y + fontSize * 1.35 : pos.y;
+    const shadow = Math.max(4, fontSize * 0.22) + letterPad;
+    return { top: boxTop - shadow, bottom: boxBottom + shadow };
+  };
+
+  if (cfg.title.mode !== 'none') {
+    const fs = Math.max(1, Number(cfg.title.fontSize) || 36);
+    const box = textBox(
+      cfg.title.mode === 'all' ? forceOuter(cfg.title.position) : cfg.title.position,
+      fs, Number(cfg.title.offset) || 20, 4);
+    top = Math.min(top, box.top);
+    bottom = Math.max(bottom, box.bottom);
+  }
+
+  if (cfg.time.mode !== 'none') {
+    const fs = Math.max(1, Number(cfg.time.fontSize) || 20);
+    const box = textBox(cfg.time.position, fs, Number(cfg.time.offset) || 12, 4);
+    top = Math.min(top, box.top);
+    bottom = Math.max(bottom, box.bottom);
+  }
+
+  if (cfg.backdrop.enabled) {
+    const bp = Math.max(0, Number(cfg.backdrop.padding) || 0);
+    top -= bp; bottom += bp;
+  }
+
+  const y = Math.max(0, Math.floor(top - pad));
+  const h = Math.min(H - y, Math.ceil(bottom + pad) - y);
+  // 给个下限，避免极端参数下带子太薄
+  return { y, h: Math.max(Math.min(H, 120), h) };
+}
+
+/**
  * 渲染一帧。
  * @param {CanvasRenderingContext2D} ctx
  * @param {object} cfg
@@ -560,12 +621,12 @@ function renderScene(ctx, cfg, t, opts) {
 
 /**
  * 估算导出耗时（毫秒）。
- * 实测 1920×1080：浏览器绘制 + PNG 编码约 8ms，ffmpeg 编码约 12ms，
- * 两者流水线并行，所以按每帧约 14ms 估，再按画布像素数等比放大。
+ * 实测 1920×1080 端到端约 8ms/帧（只渲染内容带 + QuickTime 动画编码）。
+ * 这里按 10ms 估，留一点余量，再按画布像素数等比放大。
  */
 function estimateRenderMs(frameCount, width, height) {
   const px = (width || 1920) * (height || 1080);
-  const perFrame = Math.max(4, 14 * (px / (1920 * 1080)));
+  const perFrame = Math.max(3, 10 * (px / (1920 * 1080)));
   return Math.round(frameCount * perFrame + 4000);
 }
 
@@ -573,6 +634,7 @@ window.VBarScene = {
   FONT_STACK,
   defaultConfig,
   computeGeometry,
+  computeBand,
   normalizeChapters,
   segmentsOf,
   renderScene,

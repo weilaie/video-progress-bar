@@ -11,9 +11,9 @@
 
 **第一步：下载免安装包。**
 
-**[点这里直接下载（Windows 64 位，63.5 MB）](https://github.com/weilaie/video-progress-bar/releases/latest/download/video-progress-bar-v1.0.0-win64.zip)**
+**[点这里直接下载（Windows 64 位，63.5 MB）](https://github.com/weilaie/video-progress-bar/releases/latest/download/video-progress-bar-v1.0.2-win64.zip)**
 
-下载下来的文件名是 `video-progress-bar-v1.0.0-win64.zip`。
+下载下来的文件名是 `video-progress-bar-v1.0.2-win64.zip`。
 如果你是从发布页手动下载，注意别拿成 `Source code (zip)`——那个是纯源码，不含运行环境。
 
 **第二步：解压。** 解压到任意文件夹，路径里尽量别带特殊符号。
@@ -86,11 +86,15 @@
 
 | 格式 | 什么时候用 |
 | --- | --- |
-| **ProRes 4444（.mov，带透明通道）** | **首选**。剪映专业版、Pr、达芬奇都能直接认透明通道，拖上去即可，画质接近无损。 |
-| QuickTime PNG（.mov，带透明通道，无损） | 逐像素完美无损，而且比 ProRes 更快，代价是文件略大。 |
+| **QuickTime 动画（.mov，带透明通道）** | **默认**。逐像素无损，速度最快，文件大约只有 ProRes 的五分之一。 |
+| ProRes 4444（.mov，带透明通道） | **兼容性最保险**。万一上面那个在某些软件里导不进去，换这个。文件大 5 倍、慢一倍。 |
+| QuickTime PNG（.mov，带透明通道，无损） | 逐像素完美无损，速度也快，文件比「动画」大一些。 |
 | PNG 序列（文件夹） | 万能兜底。任何软件都能导入图片序列，效果和视频一模一样。 |
 | MP4 预览版（深色底） | 没有透明通道，用来自己快速确认效果、或者发给别人看。 |
 | 纯色底 MOV（便于抠像） | 万一某个软件不认透明通道，用绿色底导出后用「色度抠像」抠掉。 |
+
+> ⚠️ **双击打不开、提示「文件已损坏」是正常的**：带透明通道的 .mov 在 Windows 自带播放器里打不开，
+> 它是给剪辑软件用的。想确认效果，点导出完成后的 **「生成可直接播放的预览版」**。
 
 **导出位置**默认在视频所在文件夹，文件名默认是 `原文件名_进度条`。
 
@@ -99,9 +103,20 @@
 ## 四、常见问题
 
 **导出要多久？**
-大约和「视频时长 × 帧率」成正比。1920×1080、30 帧、1 分钟的视频大约 **30 秒左右**。
-如果换成「QuickTime PNG」格式会更快一些。
+大约和「视频时长 × 帧率」成正比。1920×1080、30 帧、1 分钟的视频大约 **15~20 秒**。
 导出过程中会显示进度和预计剩余时间，随时可以点「取消」。
+
+速度上做过这些优化（都有实测数据）：
+
+- 只渲染画面底部真正有内容的横条，再由 ffmpeg 贴回整帧，省掉约 3/4 的像素处理
+- 编码器换成 QuickTime 动画：比 ProRes 4444 快一倍多，文件小 5 倍，而且逐像素无损
+- 导出期间停掉界面的动画：只要页面在持续动画，浏览器每帧都会被硬卡到 1/60 秒
+
+**导出完发现视频比素材短一大截？**
+这是早期版本的 bug，已经修好了：当时为了提速让两批画面同时写进编码器，
+结果字节流交叉把画面数据写坏了，编码器只解出前面一小段。
+现在已经改成严格按顺序写入，并且加了专门的回归测试盯着它。
+如果你手上还有那时候导出的短文件，重新导一次就正常了。
 
 **画质到底怎么样？**
 导出的是近乎无损的画面：与原始画面逐像素比对，最大偏差只有 1/255，肉眼完全看不出来。
@@ -162,8 +177,12 @@ tools/
   pick.ps1              ← 系统文件选择框
   selftest.js           ← 后端自检：node tools/selftest.js
   browser-test.js       ← 浏览器端到端自检：node tools/browser-test.js
+  ui-flow.js            ← 完整界面流程自检：node tools/ui-flow.js
   bench.js              ← 导出速度 / 画质基准：node tools/bench.js
+  render-bench.js       ← 前端渲染分段计时：node tools/render-bench.js
+  encoder-bench.js      ← 透明通道编码器横评：node tools/encoder-bench.js
   probe-check.js        ← 视频信息解析自检：node tools/probe-check.js
+  package.ps1           ← 打包发行版：powershell -File tools\package.ps1 -Version 1.0.2
 config/
   server.log            ← 后台日志
   settings.json         ← 记住 ffmpeg 位置、上次的导出目录、自定义的 ffmpeg 查找路径
@@ -178,4 +197,6 @@ config/
 ```powershell
 node tools\selftest.js        # 后端：素材探测 + 五种导出格式 + 透明通道校验
 node tools\browser-test.js    # 前端：真实浏览器渲染 40 项像素校验 + 完整导出链路
+node tools\ui-flow.js         # 界面全流程：填路径 → 点导出 → 检查成品时长和素材一致
+node tools\probe-check.js     # 各分辨率素材的信息解析
 ```

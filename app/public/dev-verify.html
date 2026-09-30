@@ -411,6 +411,70 @@ function preview(cfg, t, title) {
 }
 
 /* ---------- 输出 ---------- */
+/* ---------- 10. 只渲染内容带，必须和整帧渲染逐像素一致 ---------- */
+{
+  const cases = [
+    ['默认外观（底部）', (c) => { c.chapters = [{start:0,title:'第一章 开场'},{start:30,title:'第二章 铺垫'},{start:60,title:'第三章 收尾'}]; }],
+    ['顶部 + 粗条 + 大标题', (c) => {
+      c.bar.position = 'top'; c.bar.thickness = 40; c.bar.offsetY = 120;
+      c.title.mode = 'all'; c.title.fontSize = 90; c.title.offset = 60; c.title.position = 'aboveCenter';
+      c.time.mode = 'currentTotal'; c.time.fontSize = 60; c.time.position = 'belowRight'; c.time.offset = 40;
+      c.chapters = [{start:0,title:'A'},{start:45,title:'B'}];
+    }],
+    ['底部 + 时间在条下方很远处', (c) => {
+      c.time.mode = 'currentTotal'; c.time.fontSize = 48; c.time.offset = 60;
+      c.title.mode = 'intro'; c.title.fontSize = 70; c.title.offset = 40;
+      c.chapters = [{start:0,title:'闪现标题'},{start:30,title:'第二段'}];
+    }],
+    ['带背景板 + 大圆点', (c) => {
+      c.backdrop.enabled = true; c.backdrop.padding = 50;
+      c.dot.size = 5; c.bar.thickness = 20;
+      c.chapters = [{start:0,title:'第一段'},{start:30,title:'第二段'}];
+    }],
+  ];
+  for (const [label, mutate] of cases) {
+    const cfg = baseCfg();
+    cfg.canvas = { width: 960, height: 540, fps: 30, duration: 90 };
+    cfg.bar.marginX = 48; cfg.bar.offsetY = 30; cfg.bar.thickness = 10;
+    cfg.bar.glow = true; cfg.dot.show = true; cfg.dot.glow = true;
+    cfg.title.mode = 'all'; cfg.time.mode = 'currentTotal';
+    mutate(cfg);
+    const W = 960, H = 540;
+    const band = S.computeBand(cfg);
+
+    let okBand = true, okOutside = true, worst = 0, outsidePix = 0, diffCount = 0, totalPix = 0;
+    for (const tt of [0, 12, 33, 70]) {
+      const full = document.createElement('canvas'); full.width = W; full.height = H;
+      const fctx = full.getContext('2d');
+      S.renderScene(fctx, cfg, tt, { clear: true });
+      const bandCv = document.createElement('canvas'); bandCv.width = W; bandCv.height = band.h;
+      const bctx = bandCv.getContext('2d');
+      bctx.setTransform(1, 0, 0, 1, 0, -band.y);
+      S.renderScene(bctx, cfg, tt, { clear: true });
+      const a = fctx.getImageData(0, band.y, W, band.h).data;
+      const b = bctx.getImageData(0, 0, W, band.h).data;
+      for (let i = 0; i < a.length; i++) {
+        const d = Math.abs(a[i] - b[i]);
+        if (d > worst) worst = d;
+        if (d > 1) okBand = false;          // 允许 1/255 的亚像素舍入，肉眼不可见
+        if (d > 0) diffCount++;
+        totalPix++;
+      }
+      const outside = fctx.getImageData(0, 0, W, H).data;
+      for (let y = 0; y < H; y++) {
+        if (y >= band.y && y < band.y + band.h) continue;
+        for (let x = 0; x < W; x++) {
+          if (outside[(y * W + x) * 4 + 3] > 0) { outsidePix++; okOutside = false; }
+        }
+      }
+    }
+    ok('内容带与整帧一致（误差 ≤1/255）：' + label, okBand,
+      `最大差异 ${worst}，差异像素 ${diffCount}/${totalPix}`);
+    ok('带子以外确实没有内容：' + label, okOutside, `带外像素 ${outsidePix}`);
+  }
+}
+
+/* ---------- 输出 ---------- */
 lines.push('SUMMARY ' + (checks - fails) + '/' + checks + ' passed, ' + fails + ' failed');
 document.getElementById('out').textContent = lines.join('\n');
 document.title = fails ? ('FAILED ' + fails) : 'ALL PASSED';

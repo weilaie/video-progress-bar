@@ -28,6 +28,7 @@
   const ctx = preview.getContext('2d');
   let dirty = true;
   let lastTick = performance.now();
+  let rafId = null;
 
   /* ---------------------------------------------------------------- */
   /* 工具                                                              */
@@ -270,6 +271,7 @@
   }
 
   function frame(now) {
+    rafId = null;
     const dt = Math.min(0.1, (now - lastTick) / 1000);
     lastTick = now;
     if (state.ui.playing) {
@@ -285,7 +287,21 @@
       drawPreview();
       updateTimeReadout();
     }
-    requestAnimationFrame(frame);
+    rafId = requestAnimationFrame(frame);
+  }
+
+  /**
+   * 导出时必须真正停掉这个常驻动画循环。
+   * 只要页面还在「持续动画」，canvas 的读回就会被对齐到刷新率上，
+   * 每帧被硬生生卡到 1/60 秒——再快的编码也白搭。
+   */
+  function setRafRunning(on) {
+    if (on) {
+      if (rafId == null) { lastTick = performance.now(); rafId = requestAnimationFrame(frame); }
+    } else if (rafId != null) {
+      cancelAnimationFrame(rafId);
+      rafId = null;
+    }
   }
 
   function updateTimeReadout() {
@@ -494,10 +510,15 @@
 
   function snapFps(fps) {
     const common = [23.976, 24, 25, 29.97, 30, 50, 59.94, 60];
+    let best = null;
+    let bestDiff = Infinity;
     for (const c of common) {
-      if (Math.abs(c - fps) < 0.06) return c;
+      const d = Math.abs(c - fps);
+      if (d < bestDiff) { bestDiff = d; best = c; }
     }
-    return Math.round(fps * 100) / 100;
+    // 取「最接近」的标准帧率，不能一碰到 29.97 就把 30 也拽过去
+    if (best != null && bestDiff < 0.05) return best;
+    return Math.round(fps * 1000) / 1000;
   }
 
   function updateMeta() {
@@ -763,10 +784,23 @@
     document.querySelector('.export-block').classList.add('running');
     setProgress(0, '准备中…');
 
+    // 只渲染「有内容的横条」，再由 ffmpeg 贴回整帧。
+    // 进度条只占画面很小一块，整帧渲染会白白多花 3 倍的像素处理时间。
+    const band = S.computeBand(state.cfg);
     const work = document.createElement('canvas');
     work.width = Math.max(2, Math.round(state.cfg.canvas.width));
-    work.height = Math.max(2, Math.round(state.cfg.canvas.height));
+    work.height = Math.max(2, Math.round(band.h));
     const wctx = work.getContext('2d');
+
+    // 关键：导出期间必须停掉常驻动画循环。
+    // 只要页面还在持续动画，canvas 的读回会被对齐到刷新率，
+    // 每帧被硬卡到约 1/60 秒（实测编码耗时从 8ms 变 16.6ms）。
+    const wasPlaying = state.ui.playing;
+    state.ui.playing = false;
+    $('btnPlay').classList.remove('playing');
+    $('playLabel').textContent = '播放';
+    setRafRunning(false);
+    document.body.classList.add('exporting');
 
     try {
       const started = await postJson('/api/start', {
@@ -778,15 +812,19 @@
         keyColor: '#00FF00',
         canvas: {
           width: work.width,
-          height: work.height,
+          height: Math.round(state.cfg.canvas.height),
           fps: state.cfg.canvas.fps,
           duration: state.cfg.canvas.duration,
         },
+        band: { y: band.y, h: work.height },
       });
       if (!started.ok) throw new Error(started.error || '无法启动导出');
       state.jobId = started.jobId;
 
       const t0 = performance.now();
+      let renderMs = 0;
+      let blobMs = 0;
+      let waitMs = 0;
       let lastUi = 0;
       // 攒够一小批再发，减少来回开销；同时最多两批在途，让渲染和编码重叠起来
       const BATCH = 8;
@@ -794,22 +832,26 @@
       let batch = [];
       const inflight = [];
       let sent = 0;
+      let seq = 0;
 
       const flush = async (isLast) => {
         if (!batch.length) return;
         const parts = batch;
         const n = parts.length;
+        const mySeq = seq++;
         batch = [];
-        const p = fetch(`/api/frame?job=${state.jobId}&n=${n}`, {
+        const p = fetch(`/api/frame?job=${state.jobId}&n=${n}&seq=${mySeq}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/octet-stream' },
           body: new Blob(parts, { type: 'application/octet-stream' }),
         }).then(async (res) => {
-          if (!res.ok) {
-            const info = await res.json().catch(() => ({}));
-            throw new Error(info.error || `发送 ${n} 帧失败`);
+          const info = await res.json().catch(() => ({}));
+          if (!res.ok || info.ok === false) {
+            if (info.cancelled) throw new Error('已取消');
+            throw new Error(info.error || `发送 ${n} 帧失败（HTTP ${res.status}）`);
           }
           sent += n;
+          state.sentFrames = sent;
           const now = performance.now();
           if (now - lastUi > 150 || isLast) {
             lastUi = now;
@@ -829,16 +871,29 @@
 
       for (let i = 0; i < total; i++) {
         if (state.cancelRequested) break;
+        const tStart = performance.now();
         const t = total > 1
           ? (i / (total - 1)) * state.cfg.canvas.duration
           : state.cfg.canvas.duration;
+        wctx.setTransform(1, 0, 0, 1, 0, -band.y);   // 把整帧内容平移到这条带上
         S.renderScene(wctx, state.cfg, t, { clear: true });
+        const tRender = performance.now() - tStart;
+        renderMs += tRender;
+        const tBlob0 = performance.now();
         const blob = await canvasToBlob(work);
+        blobMs += performance.now() - tBlob0;
         batch.push(blob);
-        if (batch.length >= BATCH) await flush(i === total - 1);
+        if (batch.length >= BATCH) {
+          const tW = performance.now();
+          await flush(i === total - 1);
+          waitMs += performance.now() - tW;
+        }
       }
+      const tEnd0 = performance.now();
       await flush(true);
       await Promise.all(inflight);
+      waitMs += performance.now() - tEnd0;
+      state.timing = { renderMs, blobMs, waitMs, total };
 
       if (state.cancelRequested) {
         await postJson('/api/cancel', { jobId: state.jobId });
@@ -865,17 +920,44 @@
       $('afterExport').dataset.path = fin.status.outputPath;
       setProgress(100, '');
       $('exportStatus').innerHTML = `完成：<b>${escapeHtml(fin.status.outputPath)}</b>`;
+
+      // 校验成品：时长/分辨率是否和素材对得上
+      const v = fin.status.verify;
+      if (v && v.ok) {
+        $('verifyStatus').innerHTML = v.kind === 'sequence'
+          ? `已校验：共 ${v.frames} 张图片（预期 ${v.expectedFrames} 张）✓`
+          : `已校验：时长 ${formatSec(v.duration)}（预期 ${formatSec(v.expectedDuration)}）· ` +
+            `${v.width}×${v.height} ✓`;
+      } else if (v) {
+        $('verifyStatus').innerHTML = `<span style="color:var(--warn)">校验发现问题：` +
+          `${escapeHtml(JSON.stringify(v).slice(0, 200))}</span>`;
+      } else {
+        $('verifyStatus').textContent = '';
+      }
+      $('previewStatus').textContent = '';
+      $('btnPreview').disabled = false;
+      $('btnPreview').hidden = currentFormat() === 'preview_mp4';
     } catch (e) {
       $('exportStatus').innerHTML =
         `<span style="color:var(--danger)">导出失败：${escapeHtml(String(e.message || e))}</span>`;
+      $('verifyStatus').textContent = '已丢弃没写完的文件，磁盘上不会留下打不开的残片。';
       setProgress(0, '');
     } finally {
       state.exporting = false;
       $('btnExport').disabled = false;
       $('btnCancel').hidden = true;
       document.querySelector('.export-block').classList.remove('running');
+      state.ui.playing = wasPlaying;
+      setRafRunning(true);
+      document.body.classList.remove('exporting');
+      dirty = true;
       updateEstimate();
     }
+  }
+
+  function formatSec(sec) {
+    if (sec == null) return '?';
+    return S.formatClock(sec, sec >= 3600) + (sec >= 60 ? `（${sec.toFixed(2)} 秒）` : '');
   }
 
   /* ---------------------------------------------------------------- */
@@ -1052,6 +1134,29 @@
       if (p) postJson('/api/reveal', { path: p });
     });
 
+    $('btnPreview').addEventListener('click', async () => {
+      const p = $('afterExport').dataset.path;
+      if (!p) return;
+      const btn = $('btnPreview');
+      btn.disabled = true;
+      $('previewStatus').textContent = '正在生成预览版（把透明背景垫成深色，方便直接播放）…';
+      try {
+        const res = await postJson('/api/make-preview', { file: p });
+        if (res.ok) {
+          $('previewStatus').innerHTML = `预览版已生成：<b>${escapeHtml(res.path)}</b>（可以双击播放）`;
+          $('afterExport').dataset.previewPath = res.path;
+        } else {
+          $('previewStatus').innerHTML =
+            `<span style="color:var(--danger)">生成失败：${escapeHtml(res.error || '')}</span>`;
+        }
+      } catch (e) {
+        $('previewStatus').innerHTML =
+          `<span style="color:var(--danger)">生成失败：${escapeHtml(String(e.message || e))}</span>`;
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
     $('btnHelp').addEventListener('click', () => { $('helpModal').hidden = false; });
     $('btnCloseHelp').addEventListener('click', () => { $('helpModal').hidden = true; });
     $('helpModal').addEventListener('click', (e) => {
@@ -1082,6 +1187,21 @@
   syncControls();
   updateEstimate();
   initEnv();
-  requestAnimationFrame(frame);
+  setRafRunning(true);
   setTimeout(() => maybeFetchThumb(true), 300);
+
+  // 调试用的观察点（自检脚本会读它）
+  window.__vbar = {
+    state,
+    jobId: () => state.jobId,
+    sentFrames: () => state.sentFrames,
+    timing: () => state.timing,
+    stopThumb: () => {
+      if (state.ui.thumb && state.ui.thumb.close) state.ui.thumb.close();
+      state.ui.thumb = null;
+      state.ui.bgMode = 'dark';
+      dirty = true;
+    },
+    pauseRAF: (on) => { setRafRunning(!on); },
+  };
 })();

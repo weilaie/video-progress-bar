@@ -114,6 +114,8 @@ async function main() {
   const fflib0 = require(path.join(ROOT, 'app', 'lib', 'ffmpeg.js'));
   const ffInfo = fflib0.locate();
   if (!ffInfo) { console.error('没有找到 ffmpeg'); process.exit(1); }
+  // 每次从干净目录开始，避免上一次自检留下的文件干扰
+  fs.rmSync(path.join(ROOT, '.selftest'), { recursive: true, force: true });
   const srcVideo = path.join(ROOT, '.selftest', 'source.mp4');
   if (!fs.existsSync(srcVideo)) {
     fs.mkdirSync(path.dirname(srcVideo), { recursive: true });
@@ -201,12 +203,12 @@ async function main() {
       const fflib = require(path.join(ROOT, 'app', 'lib', 'ffmpeg.js'));
       const info = fflib.locate();
       const probe = spawnSync(info.path, ['-hide_banner', '-i', f], { encoding: 'utf8', windowsHide: true }).stderr;
-      const is4444 = /prores \(4444\)/.test(probe);
+      const isAlphaMov = /qtrle|prores \(4444\)/.test(probe);
       const isSize = /960x540/.test(probe);
       console.log('   文件: ' + f);
-      console.log('   ' + (is4444 ? 'PASS' : 'FAIL') + '  浏览器渲染产出为 ProRes 4444 透明视频');
+      console.log('   ' + (isAlphaMov ? 'PASS' : 'FAIL') + '  浏览器渲染产出为带透明通道的 mov');
       console.log('   ' + (isSize ? 'PASS' : 'FAIL') + '  分辨率 960x540 正确');
-      if (!is4444) failures++;
+      if (!isAlphaMov) failures++;
       if (!isSize) failures++;
 
       // 抽查 alpha：第 1 帧 10% 处应仍是轨道（透明部分 alpha<255），90% 处应为填充色不透明
@@ -322,32 +324,7 @@ async function main() {
     });
 
     // ---------- D. 1080p 单帧渲染耗时基准 ----------
-    // ---------- C3. 1080p 端到端导出速度 ----------
-    await cdp.send('Page.navigate', {
-      url: BASE + '/dev-export.html?w=1920&h=1080&dur=5&fps=30&name=bench1080',
-    });
-    const benchText = await waitFor(async () => {
-      const t = await cdp.evaluate('document.getElementById("out") ? document.getElementById("out").textContent : ""');
-      return t && (t.includes('SUMMARY done') || t.includes('FAIL')) ? t : null;
-    }, 180000, '1080p 导出基准');
-    const msMatch = /用时\s*(\d+)\s*ms/.exec(benchText);
-    const perFrame = msMatch ? Number(msMatch[1]) / 150 : 0;
-    console.log('\\n[1080p 端到端导出]');
-    if (benchText.includes('SUMMARY done') && perFrame > 0) {
-      console.log('   PASS  150 帧（5 秒 30fps）实际用时 ' + msMatch[1] + ' ms  →  ' + perFrame.toFixed(1) + ' ms/帧');
-      console.log('        推算 1 分钟视频约 ' + Math.round(perFrame * 1800 / 1000) + ' 秒');
-    } else {
-      console.log('   FAIL  1080p 导出基准失败');
-      failures++;
-    }
-
-    // 基准跑完再回到自检页
-    await cdp.send('Page.navigate', { url: BASE + '/dev-verify.html' });
-    await waitFor(async () => {
-      const t = await cdp.evaluate('document.getElementById("out") ? document.getElementById("out").textContent : ""');
-      return t && t.includes('SUMMARY') ? t : null;
-    }, 30000, '回到自检页');
-
+    // 端到端速度由 ui-flow.js 负责测（它走真实界面，数字才有意义）
     // ---------- D. 1080p 单帧渲染耗时基准 ----------
     const bench = await cdp.evaluate(`(async () => {
       const cv = document.createElement('canvas');

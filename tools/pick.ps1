@@ -1,4 +1,4 @@
-param(
+﻿param(
   [string]$Mode = 'file',
   [string]$Filter = '所有文件|*.*',
   [string]$Title = '请选择',

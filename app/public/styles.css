@@ -383,6 +383,18 @@ input[type="checkbox"]:checked::after { left: 17px; background: #fff; }
 .modal-box .row.end { margin-top: 20px; }
 
 /* 素材浏览器 */
+/*
+ * 导出期间必须让页面「彻底静下来」。
+ * 只要页面里还有 CSS 过渡/动画在跑，canvas 的读回就会被对齐到刷新率，
+ * 每帧白白多等一个 1/60 秒——实测能把编码耗时翻倍。
+ */
+body.exporting *,
+body.exporting *::before,
+body.exporting *::after {
+  transition: none !important;
+  animation: none !important;
+}
+
 .modal-box.wide { width: min(860px, 94vw); }
 .browse-bar { display: flex; gap: 8px; margin-bottom: 10px; }
 .browse-bar select { width: 92px; flex: none; }

@@ -99,6 +99,7 @@
               <option value="29.97">29.97</option>
               <option value="30" selected>30</option>
               <option value="50">50</option>
+              <option value="59.94">59.94</option>
               <option value="60">60</option>
             </select>
           </div>
@@ -428,9 +429,12 @@
           <div class="bar" id="progressBar"></div>
         </div>
         <div class="meta" id="exportStatus"></div>
+        <div class="meta" id="verifyStatus"></div>
         <div class="row" id="afterExport" hidden>
           <button class="btn" id="btnReveal">打开所在文件夹</button>
+          <button class="btn" id="btnPreview">生成可直接播放的预览版</button>
         </div>
+        <div class="meta" id="previewStatus"></div>
       </div>
     </details>
 
@@ -467,6 +471,10 @@
     </ol>
     <h3>关于透明通道</h3>
     <p>导出的文件背景是全透明的，进度条以外的地方没有像素，不需要抠像。如果某个软件不认透明通道，就改用「PNG 序列」或「纯色底 MOV」。</p>
+    <h3>为什么双击打不开、提示「文件已损坏」？</h3>
+    <p>带透明通道的 <b>.mov 在 Windows 自带播放器里就是打不开的</b>，这不是文件坏了——它是给剪辑软件用的。
+    想确认效果，点导出完成后的 <b>「生成可直接播放的预览版」</b>，会生成一个深色底、双击就能看的 MP4。
+    真正要用的时候，把它拖进剪映 / Pr / 达芬奇即可。</p>
     <h3>关于速度</h3>
     <p>导出时间取决于「视频时长 × 帧率」：1920×1080、30 帧、1 分钟的视频大约 20 秒左右。</p>
     <div class="row end"><button class="btn primary" id="btnCloseHelp">知道了</button></div>

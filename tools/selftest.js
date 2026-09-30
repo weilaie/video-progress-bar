@@ -96,6 +96,10 @@ async function main() {
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+  // 自检也要发心跳，否则跑久了后台会以为界面关了而自动退出
+  const heartbeat = setInterval(() => {
+    fetch(BASE + '/api/ping').catch(() => {});
+  }, 10000);
   let serverLog = '';
   server.stdout.on('data', (b) => { serverLog += b.toString(); });
   server.stderr.on('data', (b) => { serverLog += b.toString(); });
@@ -377,7 +381,165 @@ async function main() {
     const batchProbe = ff(['-i', batchFin.status.outputPath]).stderr;
     ok('批量帧没有丢帧（时长 0.1 秒）', /Duration: 00:00:00\.10/.test(batchProbe),
       batchProbe.match(/Duration: [^,]*/)?.[0]);
+
+    // ---------- 12. 多批并发不能丢帧（回归：曾经因此导致导出时长变短） ----------
+    console.log('\n[12] 多批同时发送：不能丢帧、不能乱序');
+    const redPng = path.join(TMP, 'red.png');
+    const bluePng = path.join(TMP, 'blue.png');
+    ff(['-f', 'lavfi', '-i', 'color=c=red:s=640x360,format=rgba', '-frames:v', '1', '-y', redPng]);
+    ff(['-f', 'lavfi', '-i', 'color=c=blue:s=640x360,format=rgba', '-frames:v', '1', '-y', bluePng]);
+    const redBuf = fs.readFileSync(redPng);
+    const blueBuf = fs.readFileSync(bluePng);
+
+    const concJob = await postJson('/api/start', {
+      format: 'alpha_prores',
+      outputDir: path.join(TMP, 'out'),
+      outputName: 'concurrent',
+      overwrite: true,
+      canvas: { width: 640, height: 360, fps: 30, duration: 32 / 30 },
+    });
+    const redBatch = Buffer.concat(Array.from({ length: 8 }, () => redBuf));
+    const blueBatch = Buffer.concat(Array.from({ length: 8 }, () => blueBuf));
+    const postBatch = (seq, n, body) => fetch(`${BASE}/api/frame?job=${concJob.jobId}&n=${n}&seq=${seq}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body,
+    }).then((r) => r.json());
+    // 故意乱序并发：先发 seq=1，再发 seq=0，另外两批也一起丢出去
+    await Promise.all([
+      postBatch(1, 8, blueBatch),
+      postBatch(0, 8, redBatch),
+      postBatch(2, 8, redBatch),
+      postBatch(3, 8, blueBatch),
+    ]);
+    const concFin = await postJson('/api/finish', { jobId: concJob.jobId });
+    ok('乱序并发发送后编码完成', concFin.ok, JSON.stringify(concFin).slice(0, 300));
+
+    const frameCountOf = (file) => {
+      const r = ff(['-i', file, '-map', '0:v:0', '-c', 'copy', '-f', 'null', '-']);
+      const m = /frame=\s*(\d+)/.exec(String(r.stderr || ''));
+      return m ? Number(m[1]) : -1;
+    };
+    ok('乱序并发也不丢帧（32 帧全在）', frameCountOf(concFin.status.outputPath) === 32,
+      String(frameCountOf(concFin.status.outputPath)));
+
+    // 顺序也要对：前 8 帧红、接着 8 帧蓝
+    const firstRaw = path.join(TMP, 'first.raw');
+    const ninthRaw = path.join(TMP, 'ninth.raw');
+    ff(['-i', concFin.status.outputPath, '-frames:v', '1', '-pix_fmt', 'rgba', '-f', 'rawvideo', '-y', firstRaw]);
+    ff(['-i', concFin.status.outputPath, '-vf', 'select=eq(n\\,8)', '-frames:v', '1',
+      '-pix_fmt', 'rgba', '-f', 'rawvideo', '-y', ninthRaw]);
+    const p1 = fs.readFileSync(firstRaw);
+    const p9 = fs.readFileSync(ninthRaw);
+    const o = (180 * 640 + 320) * 4;
+    ok('第 1 帧是红色（顺序正确）', p1[o] > 200 && p1[o + 2] < 60,
+      `${p1[o]},${p1[o + 1]},${p1[o + 2]}`);
+    ok('第 9 帧是蓝色（批次没有被调换）', p9[o + 2] > 200 && p9[o] < 60,
+      `${p9[o]},${p9[o + 1]},${p9[o + 2]}`);
+
+    const concStatus = await fetch(`${BASE}/api/status?job=${concJob.jobId}`).then((r) => r.json());
+    ok('ffmpeg 没有报解码错误', !/Decoding error|chunk too big/.test(concStatus.stderr || ''),
+      String(concStatus.stderr || '').slice(-200));
+
+    // ---------- 13. 默认格式（QuickTime 动画）无损 + 带 alpha ----------
+    console.log('\n[13] 默认导出格式：QuickTime 动画（qtrle）');
+    const env2 = await fetch(BASE + '/api/env').then((r) => r.json());
+    ok('默认格式是 QuickTime 动画', env2.formats[0] && env2.formats[0].key === 'alpha_qtrle',
+      env2.formats[0] && env2.formats[0].key);
+
+    const alphaSrc = path.join(TMP, 'alpha-src.png');
+    ff(['-f', 'lavfi', '-i', 'color=c=red:s=640x360,format=rgba',
+      '-vf', "geq=r='255':g='128*X/639':b='64':a='255*Y/359'",
+      '-frames:v', '1', '-y', alphaSrc]);
+    const alphaRawSrc = path.join(TMP, 'alpha-src.raw');
+    ff(['-i', alphaSrc, '-pix_fmt', 'rgba', '-f', 'rawvideo', '-y', alphaRawSrc]);
+
+    const qtJob = await postJson('/api/start', {
+      format: 'alpha_qtrle',
+      outputDir: path.join(TMP, 'out'),
+      outputName: 'qtrle',
+      overwrite: true,
+      canvas: { width: 640, height: 360, fps: 30, duration: 3 / 30 },
+    });
+    const alphaBuf = fs.readFileSync(alphaSrc);
+    for (let i = 0; i < 3; i++) {
+      await fetch(`${BASE}/api/frame?job=${qtJob.jobId}&n=1&seq=${i}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: alphaBuf,
+      });
+    }
+    const qtFin = await postJson('/api/finish', { jobId: qtJob.jobId });
+    ok('QuickTime 动画导出成功', qtFin.ok, JSON.stringify(qtFin).slice(0, 200));
+    ok('qtrle 能读出 alpha（argb）', /argb/.test(ff(['-i', qtFin.status.outputPath]).stderr),
+      ff(['-i', qtFin.status.outputPath]).stderr.match(/Video: [^\n]*/)?.[0]);
+
+    const alphaRawOut = path.join(TMP, 'alpha-out.raw');
+    ff(['-i', qtFin.status.outputPath, '-frames:v', '1', '-pix_fmt', 'rgba',
+      '-f', 'rawvideo', '-y', alphaRawOut]);
+    const srcB = fs.readFileSync(alphaRawSrc);
+    const outB = fs.readFileSync(alphaRawOut);
+    let maxDiff = 0;
+    for (let i = 0; i < Math.min(srcB.length, outB.length); i++) {
+      maxDiff = Math.max(maxDiff, Math.abs(srcB[i] - outB[i]));
+    }
+    ok('qtrle 是逐像素无损（最大误差 0）', maxDiff === 0, `最大误差 ${maxDiff}`);
+    ok('导出后有成品校验信息', qtFin.status.verify && qtFin.status.verify.ok === true,
+      JSON.stringify(qtFin.status.verify));
+
+    // 用「接近真实」的叠加层画面比体积：qtrle 应该明显小于 ProRes
+    const overlayLike = path.join(TMP, 'overlay-like.png');
+    ff(['-f', 'lavfi', '-i', 'color=c=black@0.0:s=1920x1080,format=rgba',
+      '-vf', 'drawbox=x=96:y=1010:w=1728:h=10:color=white@0.3:t=fill:replace=1,' +
+        'drawbox=x=96:y=1010:w=700:h=10:color=white@1:t=fill:replace=1,' +
+        'drawbox=x=96:y=940:w=420:h=44:color=white@1:t=fill:replace=1',
+      '-frames:v', '1', '-y', overlayLike]);
+    const sizeOf = (format, n) => {
+      const out = path.join(TMP, 'size-' + format + '.mov');
+      const buf = Buffer.concat(Array.from({ length: n }, () => fs.readFileSync(overlayLike)));
+      const r = spawnSync(fflib.locate().path, ['-hide_banner', '-loglevel', 'error',
+        '-f', 'image2pipe', '-vcodec', 'png', '-framerate', '30', '-i', '-',
+        ...(format === 'qtrle'
+          ? ['-c:v', 'qtrle', '-pix_fmt', 'argb']
+          : ['-c:v', 'prores_ks', '-profile:v', '4444', '-pix_fmt', 'yuva444p10le', '-qscale:v', '4']),
+        '-y', out], { input: buf, windowsHide: true, maxBuffer: 64 * 1024 * 1024 });
+      if (r.status !== 0 || !fs.existsSync(out)) return 0;
+      return fs.statSync(out).size;
+    };
+    const sQt = sizeOf('qtrle', 60);
+    const sPr = sizeOf('prores', 60);
+    ok('同样画面、同样帧数下 qtrle 比 ProRes 小 3 倍以上',
+      sQt * 3 < sPr,
+      `qtrle ${(sQt / 1024).toFixed(0)}KB vs ProRes ${(sPr / 1024).toFixed(0)}KB`);
+
+    // ---------- 14. 中断导出不留残片 ----------
+    console.log('\n[14] 取消导出：不留打不开的残片');
+    const cancelJob = await postJson('/api/start', {
+      format: 'alpha_qtrle',
+      outputDir: path.join(TMP, 'out'),
+      outputName: 'cancelme',
+      overwrite: true,
+      canvas: { width: 640, height: 360, fps: 30, duration: 60 },
+    });
+    for (let i = 0; i < 3; i++) {
+      await fetch(`${BASE}/api/frame?job=${cancelJob.jobId}&n=1&seq=${i}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: alphaBuf,
+      });
+    }
+    const existedBefore = fs.existsSync(cancelJob.outputPath);
+    await postJson('/api/cancel', { jobId: cancelJob.jobId });
+    await new Promise((r) => setTimeout(r, 800));
+    ok('取消后残留文件被清掉',
+      !fs.existsSync(cancelJob.outputPath),
+      `取消前存在=${existedBefore} 取消后存在=${fs.existsSync(cancelJob.outputPath)}`);
+
+    // ---------- 15. 预览版 MP4 ----------
+    console.log('\n[15] 生成可直接播放的预览版');
+    const prevRes = await postJson('/api/make-preview', { file: qtFin.status.outputPath });
+    ok('预览版生成成功', prevRes.ok && fs.existsSync(prevRes.path || ''), JSON.stringify(prevRes).slice(0, 200));
+    if (prevRes.ok) {
+      const pp = ff(['-i', prevRes.path]).stderr;
+      ok('预览版是 h264 的 mp4（能双击播放）', /h264/.test(pp), pp.match(/Video: [^\n]*/)?.[0]);
+      ok('预览版分辨率与成品一致', /640x360/.test(pp));
+    }
   } finally {
+    clearInterval(heartbeat);
     server.kill();
   }
 

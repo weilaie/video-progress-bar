@@ -297,27 +297,72 @@ async function handleApi(req, res, url) {
     if (!job.stdin || !job.stdin.writable) {
       return json(res, 200, { ok: false, error: '编码器已关闭' });
     }
+    const n = Math.max(1, Math.min(64, Number(url.searchParams.get('n') || 1)));
+    // 带 seq 的按序号排队；没带的（简单客户端）按到达顺序自动编号
+    const seqParam = url.searchParams.get('seq');
+    const seq = seqParam === null ? job.freeSeq++ : Number(seqParam);
+
+    // 关键：同一个任务必须按序号一笔一笔写进 ffmpeg 的 stdin。
+    // 两个请求同时 pipe 到同一个管道，字节流会交叉，PNG 会被截断，
+    // ffmpeg 就会大面积丢帧（这正是「导出时长变短」的原因）。
     return new Promise((resolve) => {
-      const n = Math.max(1, Math.min(64, Number(url.searchParams.get('n') || 1)));
       let finished = false;
-      const done = () => {
+      const complete = () => {
         if (finished) return;
         finished = true;
         job.frames += n;
+        job.nextSeq = seq + 1;
         json(res, 200, { ok: true, frames: job.frames });
+        const next = job.pendingFrames.get(job.nextSeq);
+        if (next) {
+          job.pendingFrames.delete(job.nextSeq);
+          next.release();
+        }
         resolve();
       };
-      req.on('error', done);
-      req.on('aborted', done);
-      req.on('end', done);
-      req.pipe(job.stdin, { end: false });
+
+      const writeThrough = () => {
+        if (!job.stdin || !job.stdin.writable) {
+          finished = true;
+          json(res, 200, { ok: false, error: '编码器已关闭' });
+          resolve();
+          return;
+        }
+        req.on('error', complete);
+        req.on('aborted', complete);
+        req.on('end', complete);
+        req.pipe(job.stdin, { end: false });
+      };
+
+      if (seq === job.nextSeq) {
+        writeThrough();
+      } else if (seq > job.nextSeq) {
+        // 还没轮到自己：先暂停这个请求，等前面的批次写完再放行
+        req.pause();
+        job.pendingFrames.set(seq, {
+          res,
+          release: () => {
+            req.resume();
+            writeThrough();
+          },
+        });
+      } else {
+        // 重复请求，直接忽略
+        finished = true;
+        json(res, 200, { ok: true, duplicate: true, frames: job.frames });
+        resolve();
+      }
     });
   }
 
   if (req.method === 'GET' && route === 'status') {
     const job = jobs.getJob(url.searchParams.get('job'));
     if (!job) return json(res, 404, { ok: false, error: '任务不存在' });
-    return json(res, 200, { ok: true, status: jobs.statusOf(job) });
+    return json(res, 200, {
+      ok: true,
+      status: jobs.statusOf(job),
+      stderr: String(job.stderrTail || '').slice(-1500),
+    });
   }
 
   if (req.method === 'POST' && route === 'finish') {
@@ -332,6 +377,13 @@ async function handleApi(req, res, url) {
 
   if (req.method === 'POST' && route === 'cancel') {
     const body = await readJson(req);
+    const job = jobs.getJob(body.jobId);
+    if (job && job.pendingFrames) {
+      for (const [, p] of job.pendingFrames) {
+        try { json(p.res, 200, { ok: false, cancelled: true }); } catch (_) {}
+      }
+      job.pendingFrames.clear();
+    }
     await jobs.cancelJob(body.jobId);
     return json(res, 200, { ok: true });
   }
@@ -364,6 +416,44 @@ async function handleApi(req, res, url) {
       } catch (_) { /* 忽略 */ }
     }
     return json(res, 200, { ok: true });
+  }
+
+  // 把导出的透明视频再合成一份「能直接双击播放」的 MP4。
+  // 透明通道的 mov 在 Windows 自带播放器里一律打不开，这是用户最容易误判「文件损坏」的地方。
+  if (req.method === 'POST' && route === 'make-preview') {
+    const body = await readJson(req);
+    const info = fflib.locate();
+    const src = body.file;
+    if (!info) return json(res, 200, { ok: false, error: '没有可用的 ffmpeg。' });
+    if (!src || !fs.existsSync(src)) return json(res, 200, { ok: false, error: '找不到源文件。' });
+
+    const meta = fflib.probeMedia(info.path, src);
+    if (!meta.ok) return json(res, 200, { ok: false, error: '读不出这个文件的视频信息。' });
+
+    const out = src.replace(/\.[^.\\/]+$/, '') + '_预览版.mp4';
+    const bg = '0x14141a';
+    const args = [
+      '-hide_banner', '-loglevel', 'error',
+      '-f', 'lavfi', '-i', `color=c=${bg}:s=${meta.width}x${meta.height}:r=${meta.fps || 30}`,
+      '-i', src,
+      '-filter_complex', '[0:v][1:v]overlay=format=auto,format=yuv420p',
+      '-c:v', 'libx264', '-crf', '20', '-preset', 'veryfast',
+      '-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc', 'bt709', '-color_range', 'tv',
+      '-movflags', '+faststart',
+      // 注意：色块源是无限长的，用 -shortest 收不住（滤镜图不会结束），必须显式限时
+      '-t', String(Math.max(0.1, meta.duration + 0.05)),
+      '-y', out,
+    ];
+    const result = await new Promise((resolve) => {
+      const child = spawn(info.path, args, { windowsHide: true });
+      let err = '';
+      child.stderr.on('data', (b) => { err += b.toString(); });
+      child.on('error', (e) => resolve({ ok: false, error: String(e.message || e) }));
+      child.on('close', (code) => resolve(code === 0
+        ? { ok: true, path: out }
+        : { ok: false, error: err.slice(-400) || `退出码 ${code}` }));
+    });
+    return json(res, 200, result);
   }
 
   if (req.method === 'GET' && route === 'open-in-editor-hint') {
@@ -439,7 +529,8 @@ function onReady(port) {
 // 浏览器窗口关掉后自动退出
 setInterval(() => {
   if (Date.now() - serverStartedAt < 120000) return;
-  if (Date.now() - lastHeartbeat > 60000) {
+  if (jobs.hasActiveJob()) return;          // 正在导出时绝不退出
+  if (Date.now() - lastHeartbeat > 90000) {
     console.log('界面已关闭，工具退出。');
     process.exit(0);
   }
