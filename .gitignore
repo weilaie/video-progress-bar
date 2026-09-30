@@ -1,0 +1,18 @@
+# 运行日志与本地设置（含个人路径，不上传）
+config/server.log
+config/pick.log
+config/settings.json
+
+# 自检产生的临时目录
+.selftest/
+
+# 依赖与本地二进制的存放位置
+node_modules/
+bin/
+*.exe
+
+# 杂项
+*.log
+Thumbs.db
+Desktop.ini
+.DS_Store

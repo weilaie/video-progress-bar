@@ -1,0 +1,454 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>渲染校验</title>
+<style>
+  body { margin: 0; background: #101318; color: #dfe5f2; font: 13px "Microsoft YaHei UI", sans-serif; padding: 14px; }
+  h3 { margin: 12px 0 6px; font-size: 12.5px; color: #8fb8ff; font-weight: 600; }
+  .wrap { display: inline-block; }
+  .cell { width: 640px; height: 360px; display: block; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  .checker {
+    background-color: #2a2f3a;
+    background-image:
+      linear-gradient(45deg, #20242d 25%, transparent 25%),
+      linear-gradient(-45deg, #20242d 25%, transparent 25%),
+      linear-gradient(45deg, transparent 75%, #20242d 75%),
+      linear-gradient(-45deg, transparent 75%, #20242d 75%);
+    background-size: 24px 24px;
+    background-position: 0 0, 0 12px, 12px -12px, -12px 0;
+  }
+  #out { position: fixed; left: -9999px; top: 0; }
+</style>
+</head>
+<body>
+<h1 style="font-size:14px;margin:0 0 8px">进度条渲染校验（棋盘格 = 透明）</h1>
+<div class="grid" id="grid"></div>
+<pre id="out"></pre>
+
+<script src="/scene.js"></script>
+<script>
+const S = window.VBarScene;
+const lines = [];
+let checks = 0, fails = 0;
+
+function ok(name, cond, extra) {
+  checks++;
+  if (!cond) fails++;
+  lines.push((cond ? 'PASS  ' : 'FAIL  ') + name + (cond ? '' : '   >>> ' + (extra === undefined ? '' : extra)));
+}
+
+function newCanvas(w, h) {
+  const cv = document.createElement('canvas');
+  cv.width = w; cv.height = h;
+  return cv;
+}
+
+function px(imageData, x, y) {
+  const i = (Math.round(y) * imageData.width + Math.round(x)) * 4;
+  return [imageData.data[i], imageData.data[i + 1], imageData.data[i + 2], imageData.data[i + 3]];
+}
+
+function baseCfg() {
+  const c = S.defaultConfig();
+  c.canvas = { width: 1920, height: 1080, fps: 30, duration: 90 };
+  c.bar.marginX = 96;
+  c.bar.offsetY = 60;
+  c.bar.thickness = 10;
+  c.bar.glow = false;
+  c.bar.trackColor = '#ff0000';
+  c.bar.trackAlpha = 1;
+  c.bar.fillColor = '#00ff00';
+  c.bar.fillColor2 = '#00ff00';
+  c.bar.gradient = false;
+  c.dot.show = false;
+  c.title.mode = 'none';
+  c.time.mode = 'none';
+  c.ticks.style = 'line';
+  return c;
+}
+
+function render(cfg, t) {
+  const cv = newCanvas(1920, 1080);
+  const ctx = cv.getContext('2d');
+  S.renderScene(ctx, cfg, t, { clear: true });
+  return ctx.getImageData(0, 0, 1920, 1080);
+}
+
+function preview(cfg, t, title) {
+  const box = document.createElement('div');
+  const h = document.createElement('h3');
+  h.textContent = title;
+  const wrap = document.createElement('div');
+  wrap.className = 'wrap checker';
+  const cv = newCanvas(1920, 1080);
+  cv.className = 'cell';
+  cv.style.width = '640px'; cv.style.height = '360px';
+  cv.getContext('2d');
+  wrap.appendChild(cv);
+  box.appendChild(h); box.appendChild(wrap);
+  document.getElementById('grid').appendChild(box);
+  S.renderScene(cv.getContext('2d'), cfg, t, { clear: true });
+}
+
+/* ---------- 1. 基本几何：半程时填充应到一半 ---------- */
+{
+  const cfg = baseCfg();
+  const g = S.computeGeometry(cfg);
+  const im = render(cfg, 45);          // 90 秒的 50%
+  const cy = g.track.y + g.track.h / 2;
+  const xFill = g.track.x + g.track.w * 0.25;
+  const xTrack = g.track.x + g.track.w * 0.75;
+  const p1 = px(im, xFill, cy);
+  const p2 = px(im, xTrack, cy);
+  ok('半程时左四分之一是已播放色', p1[0] < 20 && p1[1] > 230 && p1[3] > 250, JSON.stringify(p1));
+  ok('半程时右四分之一是轨道色', p2[0] > 230 && p2[1] < 20 && p2[3] > 250, JSON.stringify(p2));
+
+  // 边界应落在 1/2 处（±8px）
+  const bx = g.track.x + g.track.w * 0.5;
+  const before = px(im, bx - 8, cy);
+  const after = px(im, bx + 8, cy);
+  ok('填充边界落在 50% 位置', before[1] > 200 && after[0] > 200,
+    `before=${JSON.stringify(before)} after=${JSON.stringify(after)}`);
+
+  ok('进度条上方完全透明', px(im, 960, g.track.y - 80)[3] === 0, JSON.stringify(px(im, 960, g.track.y - 80)));
+  ok('进度条左侧外完全透明', px(im, g.track.x - 20, cy)[3] === 0);
+  ok('进度条右侧外完全透明', px(im, g.track.x + g.track.w + 20, cy)[3] === 0);
+
+  // 胶囊圆角：左上角尖角处应被裁掉（对比直角模式）
+  const cornerCapsule = px(im, g.track.x + 0.5, g.track.y + 0.5)[3];
+  const cfgSquare = baseCfg();
+  cfgSquare.bar.radiusMode = 'custom';
+  cfgSquare.bar.radius = 0;
+  const imSquare = render(cfgSquare, 45);
+  const cornerSquare = px(imSquare, g.track.x + 0.5, g.track.y + 0.5)[3];
+  ok('胶囊圆角被正确裁掉（直角模式角落是实的）',
+    cornerCapsule < 235 && cornerSquare > 250,
+    `capsule=${cornerCapsule} square=${cornerSquare}`);
+  ok('胶囊中心区域不透明', px(im, g.track.x + g.track.h, g.track.y + g.track.h / 2)[3] > 250);
+}
+
+/* ---------- 2. 全画布非透明像素范围必须很小（真的「没背景」） ---------- */
+{
+  const cfg = baseCfg();
+  cfg.chapters = [
+    { start: 0, title: '第一章 开场' },
+    { start: 30, title: '第二章 铺垫' },
+    { start: 60, title: '第三章 收尾' },
+  ];
+  cfg.title.mode = 'always';
+  cfg.time.mode = 'currentTotal';
+  const im = render(cfg, 40);
+  let minX = 1e9, minY = 1e9, maxX = -1, maxY = -1, count = 0;
+  for (let y = 0; y < im.height; y += 2) {
+    for (let x = 0; x < im.width; x += 2) {
+      if (im.data[(y * im.width + x) * 4 + 3] > 4) {
+        count++;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+  ok('画面有内容', count > 0);
+  ok('内容全部集中在底部 1/4 区域', maxY > 900, `maxY=${maxY}`);
+  ok('画面顶部 3/4 完全透明', minY > 700, `minY=${minY}`);
+  ok('水平不超出左右边距', minX >= 90 && maxX <= 1830, `minX=${minX} maxX=${maxX}`);
+}
+
+/* ---------- 3. 分段：留白 & 刻度 ---------- */
+{
+  const cfgGap = baseCfg();
+  cfgGap.ticks.style = 'gap';
+  cfgGap.ticks.width = 3;
+  cfgGap.chapters = [
+    { start: 0, title: '' }, { start: 30, title: '' }, { start: 60, title: '' },
+  ];
+  const gGap = S.computeGeometry(cfgGap);
+  const imGap = render(cfgGap, 5);
+  const gapX = gGap.track.x + gGap.track.w / 3;
+  const insideX = gGap.track.x + gGap.track.w / 6;
+  ok('分段留白处是透明的',
+    px(imGap, gapX, gGap.track.y + gGap.track.h / 2)[3] === 0,
+    JSON.stringify(px(imGap, gapX, gGap.track.y + gGap.track.h / 2)));
+  ok('分段内部仍然有轨道', px(imGap, insideX, gGap.track.y + gGap.track.h / 2)[3] > 250);
+
+  const cfgTick = baseCfg();
+  cfgTick.ticks.style = 'line';
+  cfgTick.ticks.color = '#0000ff';
+  cfgTick.ticks.alpha = 1;
+  cfgTick.ticks.width = 4;
+  cfgTick.chapters = [
+    { start: 0, title: '' }, { start: 30, title: '' }, { start: 60, title: '' },
+  ];
+  const gTick = S.computeGeometry(cfgTick);
+  const imTick = render(cfgTick, 2);
+  const tickX = gTick.track.x + gTick.track.w / 3;
+  const above = px(imTick, tickX, gTick.track.y - gTick.track.h * 0.35);
+  const notTick = px(imTick, tickX - 40, gTick.track.y - gTick.track.h * 0.35);
+  ok('刻度线在分段处出现（延伸到条外）', above[2] > 200 && above[3] > 200, JSON.stringify(above));
+  ok('非分段处没有刻度', notTick[3] === 0, JSON.stringify(notTick));
+}
+
+/* ---------- 4. 章节标题 ---------- */
+{
+  const cfg = baseCfg();
+  cfg.chapters = [{ start: 0, title: '第一章：开场白' }, { start: 45, title: '第二章' }];
+  cfg.title.mode = 'always';
+  cfg.title.position = 'aboveLeft';
+  cfg.title.fontSize = 60;
+  const g = S.computeGeometry(cfg);
+  const im = render(cfg, 10);
+  const box = { x: g.track.x, y: g.track.y - 140, w: 900, h: 110 };
+  let px1 = 0, px2 = 0;
+  for (let y = box.y; y < box.y + box.h; y++) {
+    for (let x = box.x; x < box.x + box.w; x++) {
+      if (im.data[(y * im.width + x) * 4 + 3] > 40) px1++;
+    }
+  }
+  ok('章节标题被绘制出来', px1 > 500, `pixels=${px1}`);
+
+  const imNoTitle = render(Object.assign({}, cfg, { title: Object.assign({}, cfg.title, { mode: 'none' }) }), 10);
+  for (let y = box.y; y < box.y + box.h; y++) {
+    for (let x = box.x; x < box.x + box.w; x++) {
+      if (imNoTitle.data[(y * imNoTitle.width + x) * 4 + 3] > 40) px2++;
+    }
+  }
+  ok('关闭标题后该区域为空白', px2 === 0, `pixels=${px2}`);
+
+  // 第二段的标题应该不同
+  const im2 = render(cfg, 60);
+  let diff = 0;
+  for (let y = box.y; y < box.y + box.h; y++) {
+    for (let x = box.x; x < box.x + box.w; x++) {
+      const a = im.data[(y * im.width + x) * 4 + 3] > 40 ? 1 : 0;
+      const b = im2.data[(y * im2.width + x) * 4 + 3] > 40 ? 1 : 0;
+      if (a !== b) diff++;
+    }
+  }
+  ok('切换到第二段时标题内容变了', diff > 300, `diff=${diff}`);
+
+  // 开头闪现：闪现结束后应消失
+  const intro = Object.assign({}, cfg, {
+    title: Object.assign({}, cfg.title, { mode: 'intro', hold: 2, fadeIn: 0.3, fadeOut: 0.4 }),
+  });
+  const imIntro = render(intro, 45.5);          // 第二章刚开头
+  const imAfter = render(intro, 45 + 0.3 + 2 + 0.4 + 0.3);
+  let inIntro = 0, after = 0;
+  for (let y = box.y; y < box.y + box.h; y++) {
+    for (let x = box.x; x < box.x + box.w; x++) {
+      if (imIntro.data[(y * imIntro.width + x) * 4 + 3] > 40) inIntro++;
+      if (imAfter.data[(y * imAfter.width + x) * 4 + 3] > 40) after++;
+    }
+  }
+  ok('开头闪现时标题可见', inIntro > 300, `pixels=${inIntro}`);
+  ok('闪现结束后标题消失', after === 0, `pixels=${after}`);
+}
+
+/* ---------- 5. 时间数字 ---------- */
+{
+  const cfg = baseCfg();
+  cfg.time.mode = 'currentTotal';
+  cfg.time.position = 'belowRight';
+  cfg.time.fontSize = 40;
+  const g = S.computeGeometry(cfg);
+  const im = render(cfg, 30);
+  const y0 = g.track.y + g.track.h + 10;
+  let n = 0, rightMost = 0;
+  for (let y = y0; y < y0 + 70; y++) {
+    for (let x = g.track.x + g.track.w - 400; x < g.track.x + g.track.w + 10; x++) {
+      if (im.data[(y * im.width + x) * 4 + 3] > 40) { n++; if (x > rightMost) rightMost = x; }
+    }
+  }
+  ok('时间数字被绘制', n > 300, `pixels=${n}`);
+  ok('时间数字右对齐到进度条末端', Math.abs(rightMost - (g.track.x + g.track.w)) < 12, `right=${rightMost}`);
+}
+
+/* ---------- 6. 圆点位置跟随进度 ---------- */
+{
+  const cfg = baseCfg();
+  cfg.dot.show = true;
+  cfg.dot.color = '#0000ff';
+  cfg.dot.glow = false;
+  cfg.dot.size = 3;
+  const g = S.computeGeometry(cfg);
+  const im = render(cfg, 90 * 0.7);
+  const expect = g.track.x + g.track.w * 0.7;
+  let sum = 0, count = 0;
+  const cy = g.track.y + g.track.h / 2;
+  const r = Math.ceil(g.track.h * 3 / 2) + 4;
+  for (let y = cy - r; y <= cy + r; y++) {
+    for (let x = expect - r; x <= expect + r; x++) {
+      const p = px(im, x, y);
+      if (p[2] > 200 && p[0] < 60 && p[3] > 200) { sum += x; count++; }
+    }
+  }
+  ok('圆点被绘制', count > 100, `count=${count}`);
+  const cx = count ? sum / count : 0;
+  ok('圆点位置与 70% 进度一致', Math.abs(cx - expect) < 6, `cx=${cx.toFixed(1)} expect=${expect.toFixed(1)}`);
+}
+
+/* ---------- 7. 顶部位置 & 圆角/直角 ---------- */
+{
+  const cfgTop = baseCfg();
+  cfgTop.bar.position = 'top';
+  cfgTop.bar.offsetY = 80;
+  const gTop = S.computeGeometry(cfgTop);
+  const imTop = render(cfgTop, 45);
+  ok('顶部模式：条在画面上方', gTop.track.y === 80, String(gTop.track.y));
+  ok('顶部模式：条下方透明', px(imTop, 960, gTop.track.y + 200)[3] === 0);
+  ok('顶部模式：条所在行有内容', px(imTop, gTop.track.x + 50, gTop.track.y + 5)[3] > 200);
+
+  const cfgSq = baseCfg();
+  cfgSq.bar.radiusMode = 'custom';
+  cfgSq.bar.radius = 0;
+  const gSq = S.computeGeometry(cfgSq);
+  const imSq = render(cfgSq, 5);
+  ok('直角模式：角落也有像素',
+    px(imSq, gSq.track.x + 1, gSq.track.y + 1)[3] > 200,
+    JSON.stringify(px(imSq, gSq.track.x + 1, gSq.track.y + 1)));
+}
+
+/* ---------- 8. 时间格式化 ---------- */
+{
+  ok('0 秒 → 0:00', S.formatClock(0) === '0:00', S.formatClock(0));
+  ok('65 秒 → 1:05', S.formatClock(65) === '1:05', S.formatClock(65));
+  ok('3725 秒 → 1:02:05', S.formatClock(3725) === '1:02:05', S.formatClock(3725));
+  ok('解析 1:23 → 83 秒', S.parseTimecode('1:23') === 83, String(S.parseTimecode('1:23')));
+  ok('解析 83 → 83 秒', S.parseTimecode('83') === 83, String(S.parseTimecode('83')));
+  ok('解析 01:02.500 → 62.5 秒', Math.abs(S.parseTimecode('01:02.500') - 62.5) < 0.001);
+  ok('解析垃圾输入返回 null', S.parseTimecode('abc') === null);
+
+  const cfg = baseCfg();
+  cfg.chapters = [{ start: 0, title: 'A' }, { start: 10, title: 'B' }];
+  const segs = S.segmentsOf(cfg);
+  ok('章节切分为 2 段', segs.length === 2, String(segs.length));
+  ok('第二段起点为 10 秒', segs[1].start === 10);
+  ok('第一段终点等于第二段起点', segs[0].end === 10);
+
+  const cfgBad = baseCfg();
+  cfgBad.chapters = [{ start: 30, title: 'X' }, { start: 10, title: 'Y' }, { start: 10.0005, title: 'Z' }];
+  const norm = S.normalizeChapters(cfgBad);
+  ok('乱序章节会被排序并补上 0 起点',
+    norm[0].start === 0 && norm[1].start === 10 && norm.length === 3,
+    JSON.stringify(norm.map((n) => n.start)));
+}
+
+/* ---------- 输出 ---------- */
+/* ---------- 9. 全部并排显示章节标题 ---------- */
+{
+  const cfg = baseCfg();
+  cfg.chapters = [
+    { start: 0, title: '第一段' },
+    { start: 30, title: '第二段' },
+    { start: 60, title: '第三段' },
+  ];
+  cfg.title.mode = 'all';
+  cfg.title.position = 'aboveCenter';
+  cfg.title.fontSize = 40;
+  cfg.title.highlight = false;
+  const g = S.computeGeometry(cfg);
+  const im = render(cfg, 5);
+  const y0 = Math.round(g.track.y - 130);
+  const h = 110;
+
+  const counts = g.segs.map((s) => {
+    let n = 0;
+    for (let y = y0; y < y0 + h; y++) {
+      for (let x = Math.round(s.x); x < Math.round(s.x + s.w); x++) {
+        if (im.data[(y * im.width + x) * 4 + 3] > 40) n++;
+      }
+    }
+    return n;
+  });
+  ok('全部并排：三段标题同时可见', counts.every((c) => c > 100), JSON.stringify(counts));
+
+  const cfgNone = baseCfg();
+  cfgNone.chapters = cfg.chapters;
+  cfgNone.title.mode = 'none';
+  const imNone = render(cfgNone, 5);
+  let after = 0;
+  for (let y = y0; y < y0 + h; y++) {
+    for (let x = 0; x < imNone.width; x++) {
+      if (imNone.data[(y * imNone.width + x) * 4 + 3] > 40) after++;
+    }
+  }
+  ok('关闭标题后进度条上方完全空白', after === 0, String(after));
+
+  const cfgHl = baseCfg();
+  cfgHl.chapters = cfg.chapters;
+  cfgHl.title.mode = 'all';
+  cfgHl.title.position = 'aboveCenter';
+  cfgHl.title.fontSize = 40;
+  cfgHl.title.highlight = true;
+  cfgHl.title.dimAlpha = 0.4;
+  const imHl = render(cfgHl, 5);
+  const ink = (img, s) => {
+    let n = 0;
+    for (let y = y0; y < y0 + h; y++) {
+      for (let x = Math.round(s.x); x < Math.round(s.x + s.w); x++) {
+        if (img.data[(y * img.width + x) * 4 + 3] > 180) n++;
+      }
+    }
+    return n;
+  };
+  const curInk = ink(imHl, g.segs[0]);
+  const otherInk = ink(imHl, g.segs[1]);
+  ok('当前段落标题更亮、其他段落变淡', curInk > otherInk * 2 && curInk > 100,
+    `当前=${curInk} 其他=${otherInk}`);
+
+  // 标题不能跑到别人的段落里去
+  let overflow = 0;
+  const last = g.segs[g.segs.length - 1];
+  for (let y = y0; y < y0 + h; y++) {
+    for (let x = Math.round(last.x + last.w) + 6; x < im.width; x++) {
+      if (im.data[(y * im.width + x) * 4 + 3] > 40) overflow++;
+    }
+  }
+  ok('标题不会越出最后一段的范围', overflow === 0, String(overflow));
+}
+
+/* ---------- 输出 ---------- */
+lines.push('SUMMARY ' + (checks - fails) + '/' + checks + ' passed, ' + fails + ' failed');
+document.getElementById('out').textContent = lines.join('\n');
+document.title = fails ? ('FAILED ' + fails) : 'ALL PASSED';
+
+/* 视觉预览（人眼可看） */
+preview((() => { const c = baseCfg(); c.bar.glow = true; c.dot.show = true; return c; })(), 30, '默认：底部细条');
+preview((() => {
+  const c = baseCfg();
+  c.chapters = [{ start: 0, title: '第一章 · 开场' }, { start: 30, title: '第二章 · 铺垫' }, { start: 60, title: '第三章 · 收尾' }];
+  c.title.mode = 'always'; c.time.mode = 'currentTotal'; c.dot.show = true;
+  c.bar.glow = true; c.bar.fillColor = '#4ea8ff'; c.bar.fillColor2 = '#a06bff'; c.bar.gradient = true;
+  return c;
+})(), 36, '3 段 + 刻度线 + 标题 + 渐变');
+preview((() => {
+  const c = baseCfg();
+  c.bar.position = 'top'; c.bar.thickness = 26; c.bar.radiusMode = 'custom'; c.bar.radius = 10;
+  c.bar.capStyle = 'round'; c.bar.fillColor = '#ffd76a'; c.dot.show = true; c.dot.color = '#ffd76a';
+  c.chapters = [{ start: 0, title: 'A' }, { start: 22, title: 'B' }, { start: 44, title: 'C' }, { start: 66, title: 'D' }];
+  c.ticks.style = 'gap'; c.time.mode = 'current'; c.time.position = 'insideRight'; c.time.fontSize = 34;
+  return c;
+})(), 55, '顶部 + 分段留白 + 圆头 + 条内时间');
+preview((() => {
+  const c = baseCfg();
+  c.chapters = [
+    { start: 0, title: '第一章 开场' },
+    { start: 30, title: '第二章 铺垫' },
+    { start: 60, title: '第三章 收尾' },
+  ];
+  c.title.mode = 'all';
+  c.title.position = 'aboveLeft';
+  c.title.fontSize = 38;
+  c.title.highlight = true;
+  c.title.dimAlpha = 0.45;
+  c.time.mode = 'currentTotal';
+  c.dot.show = true; c.bar.glow = true;
+  c.bar.fillColor = '#4ea8ff'; c.bar.fillColor2 = '#a06bff'; c.bar.gradient = true;
+  return c;
+})(), 36, '全部并排标题（当前段落高亮）');
+</script>
+</body>
+</html>

@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>导出链路自检</title>
+<style>body{background:#101318;color:#dfe5f2;font:13px "Microsoft YaHei UI",sans-serif}</style>
+</head>
+<body>
+<h3>浏览器 → 服务 → ffmpeg 全链路自检</h3>
+<pre id="out">running…</pre>
+<script src="/scene.js"></script>
+<script>
+const S = window.VBarScene;
+const out = document.getElementById('out');
+const log = [];
+function say(s) { log.push(s); out.textContent = log.join('\n'); }
+
+function canvasToBlob(cv) {
+  if (cv.convertToBlob) return cv.convertToBlob({ type: 'image/png' });
+  return new Promise((res, rej) => cv.toBlob((b) => (b ? res(b) : rej(new Error('no blob'))), 'image/png'));
+}
+
+async function postJson(url, body) {
+  const r = await fetch(url, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}),
+  });
+  return r.json();
+}
+
+async function run() {
+  const q = new URLSearchParams(location.search);
+  const W = Number(q.get('w') || 960);
+  const H = Number(q.get('h') || 540);
+  const DUR = Number(q.get('dur') || 2);
+  const FPS = Number(q.get('fps') || 30);
+  const FMT = q.get('format') || 'alpha_prores';
+  const NAME = q.get('name') || 'browser';
+
+  // 测试素材与输出目录默认放在 <项目目录>\.selftest 下，可用 ?src= 与 ?out= 覆盖
+  const env = await (await fetch('/api/env')).json();
+  const SRC = q.get('src') || (env.root ? env.root + '\\.selftest\\source.mp4' : '');
+  const OUT = q.get('out') || (env.root ? env.root + '\\.selftest\\browser-out' : '');
+
+  // 拿一个测试视频
+  const probe = await postJson('/api/probe', { file: SRC });
+  if (!probe.ok) { say('FAIL 找不到测试视频：' + probe.error); document.title = 'FAILED'; return; }
+  say('PASS 读到测试视频 ' + probe.width + 'x' + probe.height + ' ' + probe.duration.toFixed(2) + 's');
+
+  const cfg = S.defaultConfig();
+  cfg.canvas = { width: W, height: H, fps: FPS, duration: DUR };
+  cfg.chapters = [
+    { start: 0, title: '开场' },
+    { start: DUR / 2, title: '第二段' },
+  ];
+  cfg.title.mode = 'always';
+  cfg.time.mode = 'currentTotal';
+  cfg.dot.show = true;
+  cfg.dot.color = '#00ff00';
+  cfg.bar.fillColor = '#00ff00';
+  cfg.bar.fillColor2 = '#00ff00';
+  cfg.bar.glow = false;
+
+  const total = Math.round(cfg.canvas.duration * cfg.canvas.fps);
+  const started = await postJson('/api/start', {
+    format: FMT,
+    outputDir: OUT,
+    outputName: NAME,
+    overwrite: true,
+    canvas: cfg.canvas,
+  });
+  if (!started.ok) { say('FAIL 无法启动导出：' + started.error); document.title = 'FAILED'; return; }
+  say('PASS 导出任务已创建，共 ' + total + ' 帧');
+
+  const cv = document.createElement('canvas');
+  cv.width = cfg.canvas.width; cv.height = cfg.canvas.height;
+  const ctx = cv.getContext('2d');
+
+  const t0 = performance.now();
+  for (let i = 0; i < total; i++) {
+    const t = (i / (total - 1)) * cfg.canvas.duration;
+    S.renderScene(ctx, cfg, t, { clear: true });
+    const blob = await canvasToBlob(cv);
+    const r = await fetch('/api/frame?job=' + started.jobId, {
+      method: 'POST', headers: { 'Content-Type': 'image/png' }, body: blob,
+    });
+    if (!r.ok) { say('FAIL 第 ' + (i + 1) + ' 帧推送失败'); document.title = 'FAILED'; return; }
+  }
+  const ms = performance.now() - t0;
+  say('PASS ' + total + ' 帧全部推送完成，用时 ' + Math.round(ms) + ' ms（' + (ms / total).toFixed(1) + ' ms/帧）');
+
+  const fin = await postJson('/api/finish', { jobId: started.jobId });
+  if (!fin.ok) { say('FAIL 编码失败：' + JSON.stringify(fin).slice(0, 300)); document.title = 'FAILED'; return; }
+  say('PASS 编码完成：' + fin.status.outputPath);
+  say('SUMMARY done');
+  document.title = 'DONE';
+}
+
+run().catch((e) => { say('FAIL 异常：' + e.message); document.title = 'FAILED'; });
+</script>
+</body>
+</html>
