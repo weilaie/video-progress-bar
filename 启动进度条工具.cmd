@@ -11,7 +11,9 @@ if not errorlevel 1 (
 )
 
 rem ---- 2. locate node.exe ----
+rem Prefer the runtime bundled in this package, so it runs without Node.js installed.
 set "NODE_EXE="
+if exist "%ROOT%bin\node.exe" set "NODE_EXE=%ROOT%bin\node.exe"
 for /f "delims=" %%I in ('where node 2^>nul') do if not defined NODE_EXE set "NODE_EXE=%%I"
 if not defined NODE_EXE for /f "delims=" %%I in ('where node.exe 2^>nul') do if not defined NODE_EXE set "NODE_EXE=%%I"
 if not defined NODE_EXE if exist "%ProgramFiles%\nodejs\node.exe" set "NODE_EXE=%ProgramFiles%\nodejs\node.exe"
@@ -30,9 +32,9 @@ start "VideoBar Server" /min "%NODE_EXE%" "%ROOT%app\server.js"
 exit /b 0
 
 :nonode
-echo.
-echo   Node.js not found.
-echo   Please install it from https://nodejs.org and run this file again.
-echo.
-pause
+chcp 65001 >nul
+type "%~dp0docs\node-missing.txt"
+set "OPEN="
+set /p "OPEN=> "
+if defined OPEN start "" "https://nodejs.org/zh-cn/download"
 exit /b 1

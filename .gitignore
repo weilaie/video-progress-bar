@@ -9,6 +9,7 @@ config/settings.json
 # 依赖与本地二进制的存放位置
 node_modules/
 bin/
+dist/
 *.exe
 
 # 杂项
