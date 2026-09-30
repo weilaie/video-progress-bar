@@ -11,7 +11,10 @@
 
 **第一步：下载免安装包。**
 
-**[点这里下载最新版（Windows 64 位，约 64 MB）](https://github.com/weilaie/video-progress-bar/releases/latest)**
+**[点这里直接下载（Windows 64 位，63.5 MB）](https://github.com/weilaie/video-progress-bar/releases/latest/download/video-progress-bar-v1.0.0-win64.zip)**
+
+下载下来的文件名是 `video-progress-bar-v1.0.0-win64.zip`。
+如果你是从发布页手动下载，注意别拿成 `Source code (zip)`——那个是纯源码，不含运行环境。
 
 **第二步：解压。** 解压到任意文件夹，路径里尽量别带特殊符号。
 
